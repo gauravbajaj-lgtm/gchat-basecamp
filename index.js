@@ -15,6 +15,36 @@ const {
   PORT,
 } = process.env;
 
+const PROJECT_TO_LIST_ID = {
+  "case study : deck + website":    "9120546407",
+  "blogs: website":                 "9110129241",
+  "new website":                    "9029767677",
+  "truva":                          "9001050258",
+  "project attonomous":             "8699666732",
+  "amp template":                   "8662227827",
+  "apparel - group":                "8587548781",
+  "jockey & speedo - moengage":     "8545140731",
+  "levi's - clevertap":             "8418705199",
+  "akasa airlines":                 "7891669952",
+  "content for attributics":        "7577004160",
+  "attributics":                    "6935986330",
+  "learning track & certifications":"6859333025",
+  "unicef":                         "7161225064",
+};
+
+let cachedProjects = [];
+async function loadBasecampProjects() {
+  if (cachedProjects.length) return cachedProjects;
+  const url = `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/projects.json`;
+  const response = await axios.get(url, {
+    headers: { Authorization: `Bearer ${BASECAMP_ACCESS_TOKEN}` },
+  });
+  cachedProjects = response.data;
+  console.log("📁 Loaded Basecamp Projects:");
+  cachedProjects.forEach((p) => console.log(`   • ${p.name} (${p.id})`));
+  return cachedProjects;
+}
+
 let cachedUsers = [];
 async function loadBasecampUsers() {
   if (cachedUsers.length) return cachedUsers;
@@ -44,7 +74,9 @@ function parseTaskInput(message) {
     title = message.trim();
   }
   title = title.replace(/\b\d{4}-\d{2}-\d{2}\b/, "").trim();
-  return { title, notes, assigneeName, due_on };
+  const projectMatch = message.match(/\bp-\s*([A-Za-z0-9\s]+)/i);
+  const projectName = projectMatch ? projectMatch[1].trim() : null;
+  return { title, notes, assigneeName, due_on, projectName };
 }
 
 function getAssigneeIds(assigneeName, users) {
@@ -70,8 +102,8 @@ function getAssigneeIds(assigneeName, users) {
   return assigneeIds;
 }
 
-async function createBasecampCard(taskInfo) {
-  const url = `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/buckets/${BASECAMP_PROJECT_ID}/card_tables/lists/${BASECAMP_LIST_ID}/cards.json`;
+async function createBasecampCard(taskInfo, projectId, listId) {
+  const url = `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/buckets/${projectId}/card_tables/lists/${listId}/cards.json`;
   const cardPayload = {
     title: taskInfo.title,
     content: taskInfo.notes,
@@ -84,13 +116,13 @@ async function createBasecampCard(taskInfo) {
       "User-Agent": USER_AGENT,
     },
   });
-  console.log(`✅ Card Created: ${response.data.title} (ID: ${response.data.id})`);
+  console.log(`✅ Card Created in Project ${projectId}: ${response.data.title} (ID: ${response.data.id})`);
   return response.data;
 }
 
-async function updateBasecampCard(cardId, taskInfo) {
+async function updateBasecampCard(cardId, taskInfo, projectId) {
   if (!taskInfo.assigneeIds?.length) return;
-  const url = `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/buckets/${BASECAMP_PROJECT_ID}/card_tables/cards/${cardId}.json`;
+  const url = `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/buckets/${projectId}/card_tables/cards/${cardId}.json`;
   const updateBody = {
     assignee_ids: taskInfo.assigneeIds,
     due_on: taskInfo.due_on,
@@ -102,7 +134,15 @@ async function updateBasecampCard(cardId, taskInfo) {
       "User-Agent": USER_AGENT,
     },
   });
-  console.log(`✅ Card Updated with Assignees: ${response.data.title} (ID: ${response.data.id})`);
+  console.log(`✅ Card Updated in Project ${projectId}: ${response.data.title} (ID: ${response.data.id})`);
+}
+
+function sanitizeMessageText(text) {
+  if (!text) return "";
+  return text
+    .replace(/@\s*basecamp\s*task\s*bot/gi, "") 
+    .replace(/<@[^>]+>/g, "")
+    .trim();
 }
 
 app.post("/google-chat-webhook", async (req, res) => {
@@ -111,10 +151,31 @@ app.post("/google-chat-webhook", async (req, res) => {
     const messageData = payload?.chat?.messagePayload?.message || {};
     const sender = messageData?.sender || {};
     const space = messageData?.space || {};
-    const messageText = messageData.text || "No message text";
-    const { title, notes, due_on, assigneeName } = parseTaskInput(messageText);
+    let messageText = messageData.text || "No message text";
+    messageText = sanitizeMessageText(messageText);
+    const { title, notes, due_on, assigneeName, projectName } = parseTaskInput(messageText);
     const users = await loadBasecampUsers();
     const assigneeIds = getAssigneeIds(assigneeName, users);
+
+    let projectId = BASECAMP_PROJECT_ID;
+    let listId = BASECAMP_LIST_ID;
+    if (projectName) {
+     const projects = await loadBasecampProjects();
+     const match = projects.find((p) =>p.name.toLowerCase().includes(projectName.toLowerCase()));
+      if (match) {
+        const mappedListId = PROJECT_TO_LIST_ID[match.name.toLowerCase()];
+        console.log(`✅ Found matching project for "${projectName}": ${match.name} (${match.id})`);
+        if (mappedListId) {
+          listId = mappedListId;
+          projectId = match.id;
+          console.log(`✅ Using mapped list ID ${listId} for project "${match.name}".`);
+        } else {
+          console.log(`⚠️ No specific list ID mapped for project "${match.name}". Using default list ID.`);
+        }
+      } else {
+        console.log(`⚠️ No matching project for "${projectName}". Using default project ID.`);
+      }
+    }
 
     const taskInfo = {
       title,
@@ -129,15 +190,19 @@ app.post("/google-chat-webhook", async (req, res) => {
     console.log("🧾 Extracted Task Info:");
     console.log(JSON.stringify(taskInfo, null, 2));
 
-    res.status(200).json({
-      text: `✅ Task received from ${taskInfo.senderName}. Creating Basecamp card...`,
+    const card = await createBasecampCard(taskInfo, projectId, listId);
+    await updateBasecampCard(card.id, taskInfo, projectId);
+    return res.status(200).json({
+      text: `✅ Task successfully created in Basecamp project! (${taskInfo.title})`,
     });
-    const card = await createBasecampCard(taskInfo);
-    await updateBasecampCard(card.id, taskInfo);
   } catch (err) {
     console.error("❌ Error Handling Webhook or Basecamp API:");
     console.error(err.response?.data || err.message);
-    res.status(500).json({ error: "Internal server error" });
+    if (!res.headersSent) {
+      res.status(500).json({
+        text: `❌ Failed to create Basecamp card. ${err.response?.data?.error || err.message}`,
+      });
+    }
   }
 });
 
